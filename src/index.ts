@@ -18,7 +18,7 @@ import {
   updateOpenSignalsStopLoss,
   attachTraderBuy,
   attachTraderSell,
-  hasOpenSignalForMint,          // ✅ new import
+  hasOpenSignalForMint,
 } from "./signals.js";
 import { getSettings, updateSettings } from "./settings.js";
 import { startPriceChecker } from "./pricecheck.js";
@@ -32,6 +32,11 @@ import {
 const app = express();
 app.use(express.json());
 
+// --- tiny health check ---
+app.get("/", (_req, res) => {
+  res.type("text/plain").send("watchr OK");
+});
+
 function fmt(n: number) {
   return n.toLocaleString("en-US", { maximumFractionDigits: 6 });
 }
@@ -42,9 +47,28 @@ function money(n?: number | null) {
 }
 
 /**
+ * In-memory short-term idempotency guards
+ * - Prevents duplicate processing of the *same* event (signature) and mint/side
+ * - Prevents rapid re-buys of the same mint within a brief window (buy lock)
+ */
+const SEEN_TTL_MS = 5 * 60_000;    // keep event keys ~5 minutes
+const BUY_LOCK_MS = 60_000;        // don't buy same mint again within 60s
+
+const seenEventKeys = new Map<string, number>(); // key = `${signature}:${mint}:${side}`
+const buyLocks = new Map<string, number>();      // mint -> expiresAt
+
+function cleanMapsNow() {
+  const now = Date.now();
+  for (const [k, t] of seenEventKeys.entries()) if (now - t > SEEN_TTL_MS) seenEventKeys.delete(k);
+  for (const [m, t] of buyLocks.entries()) if (now > t) buyLocks.delete(m);
+}
+setInterval(cleanMapsNow, 60_000).unref();
+
+/**
  * Helius webhook handler
- * - Qualify BUYs, enrich with price/symbol, upsert signals, auto-buy via Jupiter (SOL budget)
- * - On SELL by the tracked wallet, close signals and auto-sell remaining balance
+ * - Aggregate transfers by (actor, side, mint) per event → single BUY/SELL per mint
+ * - Qualify and auto-buy once per mint (guarded)
+ * - On SELL by tracked wallet, close signals and auto-sell remaining balance (with clear label)
  */
 app.post("/helius-webhook", async (req: Request, res: Response) => {
   const raw = req.body;
@@ -54,7 +78,12 @@ app.post("/helius-webhook", async (req: Request, res: Response) => {
     if (e?.type !== "SWAP" && e?.type !== "SWAP_EVENT") continue;
 
     const actor: string | undefined = e.feePayer || e.account || undefined;
+    const signature: string | undefined = e.signature || e.txHash || e.sig || undefined;
     if (!actor) continue;
+
+    // Aggregate amounts per mint for this actor
+    const buys = new Map<string, number>();  // mint -> total amt to actor
+    const sells = new Map<string, number>(); // mint -> total amt from actor
 
     const txfers: any[] = Array.isArray(e.tokenTransfers) ? e.tokenTransfers : [];
     for (const t of txfers) {
@@ -66,95 +95,125 @@ app.post("/helius-webhook", async (req: Request, res: Response) => {
 
       if (!mint || !amt || amt === 0) continue;
 
-      // ===== BUYs (ignore SOL) =====
       if (to === actor) {
-        if (mint === SOL_MINT) continue;
+        // BUY
+        const prev = buys.get(mint) || 0;
+        buys.set(mint, prev + amt);
+      } else if (from === actor) {
+        // SELL
+        const prev = sells.get(mint) || 0;
+        sells.set(mint, prev + amt);
+      }
+    }
 
-        // ✅ One-and-done: if we already track an OPEN signal for this mint (any wallet), skip trade/noise
-        if (await hasOpenSignalForMint(mint)) {
-          await sendTelegram(`⚠️ Duplicate signal ignored — already tracking ${mint}`);
-          continue;
-        }
+    // ---- Handle BUYS (ignore SOL) once per mint, idempotent on (signature,mint,BUY) ----
+    for (const [mint, amt] of buys.entries()) {
+      if (mint === SOL_MINT) continue;
+      if (!amt || amt === 0) continue;
 
-        const q = await qualifyAndSnapshot({ wallet: actor, mint, amount: amt });
-        if (q.qualified) {
-          const settings = await getSettings();
-          const sig = await upsertBuy({
-            wallet: actor,
-            mint,
-            amount: amt,
-            stopLossPct: settings.stopLossPctDefault,
-            source: q.source,
-            priceUsd: q.snapshot?.priceUsd ?? null,
-            symbol: q.snapshot?.symbol ?? null,
-          });
+      // Per-event de-dupe
+      const side = "BUY";
+      const key = signature ? `${signature}:${mint}:${side}` : `${actor}:${mint}:${side}:${Math.round(amt*1e6)}`;
+      if (seenEventKeys.has(key)) continue;
+      seenEventKeys.set(key, Date.now());
 
-          // Optional auto-trade BUY (spend SOL to acquire token)
-          if (AUTO_TRADE) {
-            try {
-              const jupSig = await buyTokenWithSol(mint, TRADE_SOL_BUDGET);
-              await attachTraderBuy(sig, jupSig, TRADE_SOL_BUDGET);
-              await sendTelegram(
-                `🛒 Auto-buy executed — ${sig.symbol ? `${sig.symbol} (${mint})` : mint}\n🔑 Trader: ${traderPubkey()}\n🧾 ${jupSig}`
-              );
-            } catch (err: any) {
-              await sendTelegram(`⚠️ Auto-buy failed — \`${mint}\`\n${err?.message || err}`);
-            }
-          }
-
-          const label = sig.symbol ? `${sig.symbol} (${mint})` : `\`${mint}\``;
-          await sendTelegram(
-            `✅ Qualified — *${actor}* got *${fmt(amt)}* of ${label} @ ~${money(q.snapshot?.priceUsd)}${
-              sig.occurrences && sig.occurrences > 1 ? ` (x${sig.occurrences} merged)` : ""
-            }`
-          );
-        } else {
-          await sendTelegram(
-            `❎ Not qualified — *${actor}* got *${fmt(amt)}* of \`${mint}\`${q.reason ? ` (${q.reason})` : ""}`
-          );
-        }
+      // One-and-done guard: if already tracking this mint, skip
+      if (await hasOpenSignalForMint(mint)) {
+        await sendTelegram(`⚠️ Duplicate signal ignored — already tracking ${mint}`);
+        continue;
       }
 
-      // ===== SELLs (ignore SOL) =====
-      if (from === actor) {
-        if (mint === SOL_MINT) continue;
+      // Buy lock to avoid near-simultaneous duplicates across events
+      const lockUntil = buyLocks.get(mint) || 0;
+      const now = Date.now();
+      if (now < lockUntil) {
+        await sendTelegram(`⏳ Skipped duplicate buy (lock) — ${mint}`);
+        continue;
+      }
+      buyLocks.set(mint, now + BUY_LOCK_MS);
 
-        // Announce the wallet's sell first
-        await sendTelegram(`📉 Sell — *${actor}* sent *${fmt(amt)}* of \`${mint}\``);
-
-        const closed = await closeByWalletAndMint({
+      // Qualify & snapshot
+      const q = await qualifyAndSnapshot({ wallet: actor, mint, amount: amt });
+      if (q.qualified) {
+        const settings = await getSettings();
+        const sig = await upsertBuy({
           wallet: actor,
           mint,
-          reason: "sold_by_wallet",
+          amount: amt,
+          stopLossPct: settings.stopLossPctDefault,
+          source: q.source,
+          priceUsd: q.snapshot?.priceUsd ?? null,
+          symbol: q.snapshot?.symbol ?? null,
         });
 
-        // Auto-trade SELL: market-sell any remaining balance in trader wallet
-        if (AUTO_TRADE && closed > 0) {
+        // Auto-trade BUY (spend SOL to acquire token)
+        if (AUTO_TRADE) {
           try {
-            const bal = await getTokenBalance(mint);
-            if (bal.amount > 0n) {
-              const jupSig = await sellTokenForSol(mint, bal.amount);
-              const signals = await loadSignals();
-              const recentClosed = signals.find(
-                (s) => s.wallet === actor && s.mint === mint && s.status === "closed"
-              );
-              if (recentClosed) await attachTraderSell(recentClosed, jupSig);
-
-              // ✅ Clear label: wallet-copy auto-sell
-              await sendTelegram(`🔁 Auto-sell — Wallet-copy\n\`${mint}\`\n🧾 ${jupSig}`);
-            } else {
-              // No position; still label clearly
-              await sendTelegram(`🔒 Close — Wallet-copy (no position)\n\`${mint}\``);
-            }
-          } catch (err: any) {
+            const jupSig = await buyTokenWithSol(mint, TRADE_SOL_BUDGET);
+            await attachTraderBuy(sig, jupSig, TRADE_SOL_BUDGET);
             await sendTelegram(
-              `⚠️ Auto-sell (wallet-copy) failed for \`${mint}\`:\n${err?.message || err}`
+              `🛒 Auto-buy executed — ${sig.symbol ? `${sig.symbol} (${mint})` : mint}\n🔑 Trader: ${traderPubkey()}\n🧾 ${jupSig}`
             );
+          } catch (err: any) {
+            await sendTelegram(`⚠️ Auto-buy failed — \`${mint}\`\n${err?.message || err}`);
           }
-        } else if (closed > 0) {
-          // We closed signal but AUTO_TRADE is off
-          await sendTelegram(`🔒 Close — Wallet-copy (auto-trade OFF)\n\`${mint}\``);
         }
+
+        const label = sig.symbol ? `${sig.symbol} (${mint})` : `\`${mint}\``;
+        await sendTelegram(
+          `✅ Qualified — *${actor}* got *${fmt(amt)}* of ${label} @ ~${money(q.snapshot?.priceUsd)}${
+            sig.occurrences && sig.occurrences > 1 ? ` (x${sig.occurrences} merged)` : ""
+          }`
+        );
+      } else {
+        await sendTelegram(
+          `❎ Not qualified — *${actor}* got *${fmt(amt)}* of \`${mint}\`${q.reason ? ` (${q.reason})` : ""}`
+        );
+      }
+    }
+
+    // ---- Handle SELLS (ignore SOL) once per mint, idempotent on (signature,mint,SELL) ----
+    for (const [mint, amt] of sells.entries()) {
+      if (mint === SOL_MINT) continue;
+      if (!amt || amt === 0) continue;
+
+      const side = "SELL";
+      const key = signature ? `${signature}:${mint}:${side}` : `${actor}:${mint}:${side}:${Math.round(amt*1e6)}`;
+      if (seenEventKeys.has(key)) continue;
+      seenEventKeys.set(key, Date.now());
+
+      // Announce the tracked wallet's sell
+      await sendTelegram(`📉 Sell — *${actor}* sent *${fmt(amt)}* of \`${mint}\``);
+
+      const closed = await closeByWalletAndMint({
+        wallet: actor,
+        mint,
+        reason: "sold_by_wallet",
+      });
+
+      // Auto-trade SELL: market-sell any remaining balance in trader wallet
+      if (AUTO_TRADE && closed > 0) {
+        try {
+          const bal = await getTokenBalance(mint);
+          if (bal.amount > 0n) {
+            const jupSig = await sellTokenForSol(mint, bal.amount);
+            const signals = await loadSignals();
+            const recentClosed = signals.find(
+              (s) => s.wallet === actor && s.mint === mint && s.status === "closed"
+            );
+            if (recentClosed) await attachTraderSell(recentClosed, jupSig);
+
+            await sendTelegram(`🔁 Auto-sell — Wallet-copy\n\`${mint}\`\n🧾 ${jupSig}`);
+          } else {
+            await sendTelegram(`🔒 Close — Wallet-copy (no position)\n\`${mint}\``);
+          }
+        } catch (err: any) {
+          await sendTelegram(
+            `⚠️ Auto-sell (wallet-copy) failed for \`${mint}\`:\n${err?.message || err}`
+          );
+        }
+      } else if (closed > 0) {
+        await sendTelegram(`🔒 Close — Wallet-copy (auto-trade OFF)\n\`${mint}\``);
       }
     }
   }
