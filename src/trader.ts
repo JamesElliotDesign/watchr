@@ -1,3 +1,4 @@
+// src/trader.ts
 import fetch from "node-fetch";
 import {
   AUTO_TRADE,
@@ -58,7 +59,11 @@ type JupQuote = {
 
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
-// Minimal Jupiter quote getter
+/* -------------------------------------------
+   Robust Jupiter quote getter (v6)
+   - Accepts both top-level and { data } shapes
+   - Validates routePlan presence
+-------------------------------------------- */
 async function getQuote(params: {
   inputMint: string;
   outputMint: string;
@@ -77,9 +82,25 @@ async function getQuote(params: {
 
   const res = await fetch(url.toString(), { method: "GET" });
   if (!res.ok) return null;
-  const j: any = await res.json();
-  if (!j || !j.data) return null;
-  return j.data as JupQuote;
+
+  let j: any = null;
+  try {
+    j = await res.json();
+  } catch {
+    return null;
+  }
+  // Some responses are { data: {...} }, others are top-level {...}
+  const payload = j?.data ?? j;
+
+  // If an error shape appears, bail out
+  if (payload?.error || payload?.message === "No route found") return null;
+
+  // Validate it looks like a quote
+  if (!payload || !Array.isArray(payload.routePlan) || payload.routePlan.length === 0) {
+    return null;
+  }
+
+  return payload as JupQuote;
 }
 
 // Do a swap using Jupiter v6 swap endpoint
@@ -183,7 +204,10 @@ export async function buyTokenWithSol(mint: string, solBudget: number): Promise<
 
         // If no route, probe with a *bigger* amount to discover path (then re-quote at budget)
         if (!q) {
-          const probeLamports = Math.max(lamportsBudget, Math.floor((isFinite(JUP_PROBE_SOL) ? JUP_PROBE_SOL : 0.02) * 1e9));
+          const probeLamports = Math.max(
+            lamportsBudget,
+            Math.floor((isFinite(JUP_PROBE_SOL as any) ? (JUP_PROBE_SOL as number) : 0.02) * 1e9)
+          );
           const probe = await getQuote({
             inputMint: SOL_MINT,
             outputMint: mint,
