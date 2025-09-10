@@ -42,3 +42,11 @@ export const PRIORITY_FEE_LAMPORTS =
 export const JUP_BASE = "https://quote-api.jup.ag/v6";
 // Use SOL as base (wrapped/unwrap automatically)
 export const SOL_MINT = "So11111111111111111111111111111111111111112";
+
+/** NEW: Do we *require* a Jupiter route at qualification time?
+ * If false (default), we don't block qualification: trading will retry routes for a while.
+ */
+export const REQUIRE_JUP_ROUTE = String(process.env.REQUIRE_JUP_ROUTE || "false").toLowerCase() === "true";
+
+/** NEW: Probe amount in SOL when checking/retiring routes (helps routes appear sooner). */
+export const JUP_PROBE_SOL = Number(process.env.JUP_PROBE_SOL || 0.02);

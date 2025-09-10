@@ -1,6 +1,14 @@
 import fetch from "node-fetch";
 import { Connection, PublicKey } from "@solana/web3.js";
-import { HELIUS_API_KEY, BIRDEYE_API_KEY, TRADE_SOL_BUDGET, JUP_BASE, JUP_SLIPPAGE_BPS } from "./config.js";
+import {
+  HELIUS_API_KEY,
+  BIRDEYE_API_KEY,
+  TRADE_SOL_BUDGET,
+  JUP_BASE,
+  JUP_SLIPPAGE_BPS,
+  REQUIRE_JUP_ROUTE,
+  JUP_PROBE_SOL,
+} from "./config.js";
 import { fetchInit, timeout } from "./http.js";
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -111,22 +119,27 @@ async function birdeyeMeta(mint: string): Promise<{ symbol?: string | null; name
   }
 }
 
-/** Quick viability check: does Jupiter have a route for our budget right now? */
+/** Quick viability check: does Jupiter have a route for (max of budget/probe) right now? */
 async function jupHasRoute(mint: string): Promise<boolean> {
   try {
-    const lamports = Math.floor(TRADE_SOL_BUDGET * 1_000_000_000);
+    const baseSol = Math.max(TRADE_SOL_BUDGET, isFinite(JUP_PROBE_SOL) ? JUP_PROBE_SOL : 0.02);
+    const lamports = Math.floor(baseSol * 1_000_000_000);
     const q = new URLSearchParams({
       inputMint: SOL_MINT,
       outputMint: mint,
       amount: String(lamports),
-      slippageBps: String(JUP_SLIPPAGE_BPS),
+      slippageBps: String(Math.min(1100, Math.max(JUP_SLIPPAGE_BPS || 200, 200))),
       swapMode: "ExactIn",
       onlyDirectRoutes: "false",
+      maxAccounts: "64",
     }).toString();
     const res = await fetch(`${JUP_BASE}/quote?${q}`, fetchInit({ signal: timeout(1200) }));
     if (!res.ok) return false;
     const data: any = await res.json();
-    return Array.isArray(data?.routePlan) && data.routePlan.length > 0;
+    const out = Number(data?.outAmount ?? 0);
+    // Some responses are wrapped; also check routePlan length as another signal
+    const routed = out > 0 || (Array.isArray(data?.routePlan) && data.routePlan.length > 0);
+    return routed;
   } catch {
     return false;
   }
@@ -142,24 +155,30 @@ export async function qualifyAndSnapshot(params: {
   if (mint === SOL_MINT) return { qualified: false, reason: "sol_ignored" };
   if (isStablecoin(mint)) return { qualified: false, reason: "stablecoin_ignored" };
 
-  // 2) Run safety + route viability in parallel (fail fast)
-  const [sec, route] = await Promise.allSettled([birdeyeSecurityCheck(mint), jupHasRoute(mint)]);
-
-  let safety: SafetyResult | null = null;
-  if (sec.status === "fulfilled") safety = sec.value;
-  else safety = { safe: false, source: "birdeye", reason: "http_0" };
-
-  if (!safety.safe && (safety as any).reason?.startsWith("http_")) {
+  // 2) Run safety first
+  let safety: SafetyResult;
+  try {
+    safety = await birdeyeSecurityCheck(mint);
+    if (!safety.safe && (safety as any).reason?.startsWith("http_")) {
+      safety = await onchainSafetyCheck(mint);
+    }
+  } catch {
     safety = await onchainSafetyCheck(mint);
   }
   if (!safety.safe) return { qualified: false, reason: safety.reason, source: safety.source };
 
-  const viable = route.status === "fulfilled" ? route.value : false;
-  if (!viable) return { qualified: false, reason: "no_route" };
-
-  // 3) Snapshots (price+meta) in parallel
+  // 3) Price/meta (don’t block on failure)
   const [priceUsd, meta] = await Promise.all([birdeyePrice(mint), birdeyeMeta(mint)]);
-  const snapshot = { priceUsd, symbol: meta.symbol ?? null, name: meta.name ?? null };
 
-  return { qualified: true, source: safety.source, snapshot };
+  // 4) Route gating (configurable)
+  if (REQUIRE_JUP_ROUTE) {
+    const routable = await jupHasRoute(mint);
+    if (!routable) return { qualified: false, reason: "no_route" };
+  }
+
+  return {
+    qualified: true,
+    source: safety.source,
+    snapshot: { priceUsd: priceUsd ?? null, symbol: meta.symbol ?? null, name: meta.name ?? null },
+  };
 }

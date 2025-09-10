@@ -5,9 +5,11 @@ import {
   JUP_SLIPPAGE_BPS,
   TRADE_SOL_BUDGET,
   SOL_MINT,
+  MAX_SLIPPAGE_BPS,
+  JUP_PROBE_SOL,
 } from "./config.js";
 import { sendTelegram } from "./telegram.js";
-import { PublicKey, Connection, Keypair, SystemProgram } from "@solana/web3.js";
+import { PublicKey, Connection, Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 
 // Basic setup
@@ -56,7 +58,7 @@ type JupQuote = {
 
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
-// Generic Jupiter quote getter with flexible params
+// Minimal Jupiter quote getter
 async function getQuote(params: {
   inputMint: string;
   outputMint: string;
@@ -104,8 +106,9 @@ async function doSwap(quote: JupQuote): Promise<string> {
   if (!swapTx) throw new Error("swap missing swapTransaction");
 
   // decode and sign
+  const { VersionedTransaction } = await import("@solana/web3.js");
   const txBuf = Buffer.from(swapTx, "base64");
-  const tx = (await import("@solana/web3.js")).VersionedTransaction.deserialize(txBuf);
+  const tx = VersionedTransaction.deserialize(txBuf);
   tx.sign([trader]);
   const sig = await connection.sendTransaction(tx, { skipPreflight: false, maxRetries: 3 });
   await connection.confirmTransaction(sig, "confirmed");
@@ -127,22 +130,107 @@ export async function getTokenBalance(mint: string): Promise<{ amount: bigint; a
   return { amount: raw, ata };
 }
 
-/** BUY: spend ~solBudget SOL to acquire `mint` */
-export async function buyTokenWithSol(mint: string, solBudget: number): Promise<string> {
-  const lamports = toLamports(solBudget);
-  // quote SOL -> mint
-  const q1 = await getQuote({
-    inputMint: SOL_MINT,
-    outputMint: mint,
-    amount: lamports.toString(),
-    slippageBps: Math.min(1100, Math.max(JUP_SLIPPAGE_BPS || 200, 200)), // ensure >=200 and cap 1100
-    maxAccounts: 64,
-  });
-  if (!q1) throw new Error("noviableroute: quote not found (SOL->token)");
-  return await doSwap(q1);
+/* -----------------------------
+   BUY: dedup + retry on noviableroute
+------------------------------ */
+
+// Per-mint buy lock to avoid double-buys on burst signals
+const buyLocks = new Map<string, NodeJS.Timeout>();
+function lockMint(mint: string, ms: number) {
+  const t = buyLocks.get(mint);
+  if (t) clearTimeout(t);
+  buyLocks.set(
+    mint,
+    setTimeout(() => buyLocks.delete(mint), ms)
+  );
+}
+function unlockMint(mint: string) {
+  const t = buyLocks.get(mint);
+  if (t) clearTimeout(t);
+  buyLocks.delete(mint);
+}
+function isLocked(mint: string) {
+  return buyLocks.has(mint);
 }
 
-/** SELL: try token -> SOL with smart fallback */
+/** BUY: spend ~solBudget SOL to acquire `mint` with retry logic */
+export async function buyTokenWithSol(mint: string, solBudget: number): Promise<string> {
+  if (!AUTO_TRADE) throw new Error("AUTO_TRADE is disabled");
+  if (isLocked(mint)) throw new Error("buy lock active for this mint");
+
+  const lamportsBudget = Math.max(1, Math.floor(solBudget * 1e9));
+  const slippage = Math.min(MAX_SLIPPAGE_BPS, Math.max(JUP_SLIPPAGE_BPS || 200, 200));
+
+  // backoff ~3 minutes total
+  const delays = [5000, 7000, 8000, 10000, 12000, 15000, 15000, 15000, 15000, 15000];
+
+  // Lock during retries
+  lockMint(mint, delays.reduce((a, b) => a + b, 0) + 5000);
+
+  try {
+    let lastErr: any = null;
+
+    for (let i = 0; i <= delays.length; i++) {
+      try {
+        // Try with our budget
+        let q = await getQuote({
+          inputMint: SOL_MINT,
+          outputMint: mint,
+          amount: String(lamportsBudget),
+          slippageBps: slippage,
+          maxAccounts: 64,
+        });
+
+        // If no route, probe with a *bigger* amount to discover path (then re-quote at budget)
+        if (!q) {
+          const probeLamports = Math.max(lamportsBudget, Math.floor((isFinite(JUP_PROBE_SOL) ? JUP_PROBE_SOL : 0.02) * 1e9));
+          const probe = await getQuote({
+            inputMint: SOL_MINT,
+            outputMint: mint,
+            amount: String(probeLamports),
+            slippageBps: slippage,
+            maxAccounts: 64,
+          }).catch(() => null);
+
+          if (!probe) throw new Error("noviableroute");
+
+          // route exists at probe size, re-quote at real budget
+          q = await getQuote({
+            inputMint: SOL_MINT,
+            outputMint: mint,
+            amount: String(lamportsBudget),
+            slippageBps: slippage,
+            maxAccounts: 64,
+          });
+
+          if (!q) throw new Error("noviableroute");
+        }
+
+        return await doSwap(q);
+      } catch (err: any) {
+        lastErr = err;
+        const msg = String(err?.message || err);
+        const retryable =
+          /noviableroute/i.test(msg) ||
+          /429/.test(msg) ||
+          /5\d\d/.test(msg) ||
+          /deadline|timeout|fetch failed|EAI_AGAIN|ECONNRESET|ETIMEDOUT/i.test(msg);
+
+        if (!retryable || i === delays.length) throw err;
+        await new Promise((r) => setTimeout(r, delays[i]));
+      }
+    }
+
+    throw lastErr ?? new Error("buy failed");
+  } finally {
+    unlockMint(mint);
+  }
+}
+
+/* -----------------------------
+   SELL: existing smart fallback
+------------------------------ */
+
 export async function sellTokenForSol(mint: string, amountRaw: bigint): Promise<string> {
   if (mint === SOL_MINT) throw new Error("nothing to sell: mint is SOL");
   if (amountRaw <= 0n) throw new Error("nothing to sell: zero balance");
@@ -159,21 +247,19 @@ export async function sellTokenForSol(mint: string, amountRaw: bigint): Promise<
     return await doSwap(q);
   };
 
-  // 1) direct with your configured slippage (min 200), then up to 1100
-  const slips = Array.from(new Set([Math.max(JUP_SLIPPAGE_BPS || 200, 200), 400, 700, 900, 1100]));
+  // step 1: slippage escalate (min 200, up to MAX_SLIPPAGE_BPS, capped by constant)
+  const cap = Math.min(MAX_SLIPPAGE_BPS, 1100);
+  const base = Math.max(JUP_SLIPPAGE_BPS || 200, 200);
+  const slips = Array.from(new Set([base, 400, 700, 900, cap]));
   for (const s of slips) {
     try {
       return await tryDirect(amountRaw, s);
     } catch (e: any) {
-      if (!/noviableroute/i.test(String(e?.message))) {
-        // Non-route error: bubble up
-        throw e;
-      }
-      // else try next plan
+      if (!/noviableroute/i.test(String(e?.message))) throw e;
     }
   }
 
-  // 2) try 95% size in case of dust / constraints
+  // step 2: try 95% size
   const ninetyFive = (amountRaw * 95n) / 100n;
   if (ninetyFive > 0n) {
     for (const s of slips) {
@@ -185,8 +271,8 @@ export async function sellTokenForSol(mint: string, amountRaw: bigint): Promise<
     }
   }
 
-  // 3) Two-hop fallback: token -> USDC, then USDC -> SOL
-  const tryToUSDC = async (amt: bigint, slip: number) => {
+  // step 3: token -> USDC, then USDC -> SOL (best effort)
+  const toUSDC = async (amt: bigint, slip: number) => {
     const q = await getQuote({
       inputMint: mint,
       outputMint: USDC_MINT,
@@ -198,11 +284,10 @@ export async function sellTokenForSol(mint: string, amountRaw: bigint): Promise<
     return await doSwap(q);
   };
 
-  // 3a) token -> USDC
   for (const s of slips) {
     try {
-      const sig1 = await tryToUSDC(ninetyFive > 0n ? ninetyFive : amountRaw, s);
-      // 3b) sell USDC -> SOL (best effort)
+      const sig1 = await toUSDC(ninetyFive > 0n ? ninetyFive : amountRaw, s);
+      // second hop
       const usdcBal = await getTokenBalance(USDC_MINT);
       if (usdcBal.amount > 0n) {
         try {
@@ -217,8 +302,8 @@ export async function sellTokenForSol(mint: string, amountRaw: bigint): Promise<
             const sig2 = await doSwap(q2);
             return `${sig1} , ${sig2}`;
           }
-        } catch (_) {
-          // ignore second-hop errors, we still sold to USDC
+        } catch {
+          // ignore second-hop errors
         }
       }
       return sig1; // at least sold to USDC
